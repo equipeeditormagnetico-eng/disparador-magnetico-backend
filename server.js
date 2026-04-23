@@ -21,7 +21,7 @@ function loadDB() {
 function saveDB(data) { fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2)); }
 function defaultDB() {
   return {
-    config: { token:'', instanceId:'', clientToken:'', intervalMin:30, intervalMax:60, blockSize:20, blockPause:15, maxPerDay:150 },
+    config: { token:'', instanceId:'', clientToken:'', intervalMin:45, intervalMax:90, blockSize:10, blockPause:15, maxPerDay:55 },
     contacts: [], messages: ['','','','',''], schedule: {},
     dispatch: { running:false, paused:false, pauseReason:null, blockPauseUntil:null, currentIndex:0, sentToday:0, lastDate:'', log:[], history:[] }
   };
@@ -35,6 +35,11 @@ function resetDailyIfNeeded(db) {
   if (db.dispatch.lastDate !== today) {
     db.dispatch.sentToday = 0;
     db.dispatch.lastDate = today;
+    // Se estava pausado por limite diario, retomar no novo dia
+    if (db.dispatch.paused && db.dispatch.pauseReason === 'daily_limit') {
+      db.dispatch.paused = false;
+      db.dispatch.pauseReason = null;
+    }
   }
 }
 
@@ -66,20 +71,20 @@ async function runDispatch() {
       sent: dispatch.log.filter(l => l.status === 'success').length,
       errors: dispatch.log.filter(l => l.status === 'error').length });
     if (dispatch.history.length > 50) dispatch.history = dispatch.history.slice(0, 50);
-    saveDB(db); console.log('[DISPATCH] Finalizado!'); return;
+    saveDB(db); console.log('[DISPATCH] Todos os contatos enviados!'); return;
   }
 
   if (dispatch.sentToday >= config.maxPerDay) {
     dispatch.running = true; dispatch.paused = true; dispatch.pauseReason = 'daily_limit';
     dispatch.log.unshift({ time: new Date().toISOString(), info: `Limite diario de ${config.maxPerDay} atingido. Retomando amanha.` });
-    saveDB(db); console.log('[DISPATCH] Limite diario atingido'); return;
+    saveDB(db); console.log(`[DISPATCH] Limite diario atingido. Index preservado: ${dispatch.currentIndex}`); return;
   }
 
   const contact = contacts[dispatch.currentIndex];
   const msgTemplate = validMessages[Math.floor(Math.random() * validMessages.length)];
   let message = msgTemplate;
-  if (contact.nome && contact.nome.trim()) {
-    message = message.replace(/{nome}/gi, contact.nome.trim());
+  if (contact.nome && String(contact.nome).trim() && String(contact.nome).trim() !== '0') {
+    message = message.replace(/{nome}/gi, String(contact.nome).trim());
   } else {
     message = message.replace(/,?\s*{nome}\s*/gi, '').replace(/\s+/g, ' ').trim();
   }
@@ -89,20 +94,20 @@ async function runDispatch() {
   try {
     await sendMessage(config, phone, message);
     dispatch.sentToday++;
-    console.log(`[DISPATCH] ✅ ${phone} (${dispatch.currentIndex + 1}/${contacts.length})`);
+    console.log(`[DISPATCH] ✅ ${phone} (index:${dispatch.currentIndex} | hoje:${dispatch.sentToday}/${config.maxPerDay})`);
   } catch (e) { status = 'error'; error = e.message; console.log(`[DISPATCH] ❌ ${phone}: ${e.message}`); }
 
   dispatch.log.unshift({ time: new Date().toISOString(), nome: contact.nome || '', numero: phone, message: msgTemplate, status, error });
   if (dispatch.log.length > 500) dispatch.log = dispatch.log.slice(0, 500);
   dispatch.currentIndex++;
 
-  const blockSize = config.blockSize || 20;
+  const blockSize = config.blockSize || 10;
   const blockPause = config.blockPause || 15;
   if (dispatch.currentIndex % blockSize === 0 && dispatch.currentIndex < contacts.length) {
     const resumeAt = new Date(Date.now() + blockPause * 60 * 1000).toISOString();
     dispatch.paused = true; dispatch.pauseReason = 'block'; dispatch.blockPauseUntil = resumeAt;
     saveDB(db);
-    console.log(`[DISPATCH] Pausa de bloco — retomando em ${blockPause} min (${resumeAt})`);
+    console.log(`[DISPATCH] Pausa de bloco — index:${dispatch.currentIndex} — retomando em ${blockPause}min`);
     return;
   }
 
@@ -113,11 +118,12 @@ async function runDispatch() {
 function scheduleNext() {
   const db = loadDB();
   if (!db.dispatch.running || db.dispatch.paused) return;
+  if (dispatchTimer) clearTimeout(dispatchTimer);
   const delay = randomInt(db.config.intervalMin, db.config.intervalMax) * 1000;
   countdownValue = Math.ceil(delay / 1000);
   const tick = setInterval(() => { if (countdownValue > 0) countdownValue--; }, 1000);
   dispatchTimer = setTimeout(() => { clearInterval(tick); runDispatch(); }, delay);
-  console.log(`[DISPATCH] Proximo envio em ${countdownValue}s`);
+  console.log(`[DISPATCH] Proximo em ${countdownValue}s | index:${db.dispatch.currentIndex}`);
 }
 
 const DAYS = ['sunday','monday','tuesday','wednesday','thursday','friday','saturday'];
@@ -126,39 +132,41 @@ cron.schedule('* * * * *', () => {
   const db = loadDB();
   const now = new Date();
 
-  // RETOMAR AUTOMATICO apos pausa de bloco
+  // 1. Retomar automaticamente apos pausa de bloco
   if (db.dispatch.paused && db.dispatch.pauseReason === 'block' && db.dispatch.blockPauseUntil) {
     const resumeAt = new Date(db.dispatch.blockPauseUntil);
     if (now >= resumeAt) {
-      console.log('[CRON] ✅ Pausa de bloco expirada — retomando automaticamente!');
+      console.log(`[CRON] ✅ Pausa de bloco expirada — retomando do index ${db.dispatch.currentIndex}`);
       db.dispatch.paused = false; db.dispatch.pauseReason = null; db.dispatch.blockPauseUntil = null;
       saveDB(db); scheduleNext(); return;
     }
-    const min = Math.ceil((resumeAt - now) / 60000);
-    console.log(`[CRON] Pausa de bloco: ${min} min restantes`); return;
+    console.log(`[CRON] Bloco: ${Math.ceil((resumeAt-now)/60000)}min restantes | index:${db.dispatch.currentIndex}`); return;
   }
 
-  // RETOMAR apos limite diario no novo dia
+  // 2. Retomar apos limite diario no novo dia
   if (db.dispatch.paused && db.dispatch.pauseReason === 'daily_limit') {
     resetDailyIfNeeded(db);
     if (db.dispatch.sentToday === 0) {
-      console.log('[CRON] ✅ Novo dia — retomando apos limite diario!');
-      db.dispatch.paused = false; db.dispatch.pauseReason = null;
+      console.log(`[CRON] ✅ Novo dia — retomando do index ${db.dispatch.currentIndex}`);
       saveDB(db); scheduleNext(); return;
     }
   }
 
-  // Agendamento semanal
-  if (db.dispatch.running) return;
+  // 3. Agendamento semanal — só inicia se nao estiver rodando E for novo dia
+  if (db.dispatch.running && !db.dispatch.paused) return;
   const dayName = DAYS[now.getDay()];
   const hhmm = `${String(now.getHours()).padStart(2,'0')}:${String(now.getMinutes()).padStart(2,'0')}`;
   const slots = db.schedule[dayName] || [];
   if (slots.includes(hhmm)) {
-    const db2 = loadDB(); resetDailyIfNeeded(db2);
-    db2.dispatch.running = true; db2.dispatch.paused = false; db2.dispatch.pauseReason = null;
-    db2.dispatch.currentIndex = 0; db2.dispatch.log = [];
+    const db2 = loadDB();
+    resetDailyIfNeeded(db2);
+    // Nao reinicia o index — continua de onde parou
+    db2.dispatch.running = true;
+    db2.dispatch.paused = false;
+    db2.dispatch.pauseReason = null;
+    db2.dispatch.blockPauseUntil = null;
     saveDB(db2); scheduleNext();
-    console.log(`[CRON] Disparo agendado: ${dayName} ${hhmm}`);
+    console.log(`[CRON] ✅ Agendamento ${dayName} ${hhmm} — continuando do index ${db2.dispatch.currentIndex}`);
   }
 });
 
@@ -172,22 +180,35 @@ app.post('/api/schedule', (req, res) => { const db = loadDB(); db.schedule = req
 app.post('/api/dispatch/start', (req, res) => {
   const db = loadDB(); resetDailyIfNeeded(db);
   if (dispatchTimer) { clearTimeout(dispatchTimer); dispatchTimer = null; }
-  db.dispatch.running = true; db.dispatch.paused = false; db.dispatch.pauseReason = null;
-  db.dispatch.blockPauseUntil = null; db.dispatch.currentIndex = 0; db.dispatch.log = [];
-  saveDB(db); scheduleNext(); res.json({ ok: true });
+  db.dispatch.running = true; db.dispatch.paused = false;
+  db.dispatch.pauseReason = null; db.dispatch.blockPauseUntil = null;
+  // SO reinicia o index se explicitamente pedido
+  if (req.body && req.body.restart === true) {
+    db.dispatch.currentIndex = 0; db.dispatch.log = [];
+    console.log('[START] Reiniciando do zero');
+  } else {
+    console.log(`[START] Continuando do index ${db.dispatch.currentIndex}`);
+  }
+  saveDB(db); scheduleNext();
+  res.json({ ok: true, startingFrom: db.dispatch.currentIndex });
 });
 
 app.post('/api/dispatch/pause', (req, res) => {
   const db = loadDB();
   db.dispatch.paused = true; db.dispatch.pauseReason = 'manual'; db.dispatch.blockPauseUntil = null;
   if (dispatchTimer) { clearTimeout(dispatchTimer); dispatchTimer = null; }
-  countdownValue = 0; saveDB(db); res.json({ ok: true, pausedAt: db.dispatch.currentIndex });
+  countdownValue = 0; saveDB(db);
+  console.log(`[PAUSE] Pausado no index ${db.dispatch.currentIndex}`);
+  res.json({ ok: true, pausedAt: db.dispatch.currentIndex });
 });
 
 app.post('/api/dispatch/resume', (req, res) => {
   const db = loadDB();
-  db.dispatch.paused = false; db.dispatch.pauseReason = null; db.dispatch.blockPauseUntil = null; db.dispatch.running = true;
-  saveDB(db); scheduleNext(); res.json({ ok: true, resumingFrom: db.dispatch.currentIndex });
+  db.dispatch.paused = false; db.dispatch.pauseReason = null;
+  db.dispatch.blockPauseUntil = null; db.dispatch.running = true;
+  saveDB(db); scheduleNext();
+  console.log(`[RESUME] Retomando do index ${db.dispatch.currentIndex}`);
+  res.json({ ok: true, resumingFrom: db.dispatch.currentIndex });
 });
 
 app.get('/api/status', (req, res) => {
@@ -209,11 +230,28 @@ app.get('/api/status', (req, res) => {
 app.get('/api/history', (req, res) => res.json(loadDB().dispatch.history || []));
 app.delete('/api/history', (req, res) => { const db = loadDB(); db.dispatch.history = []; saveDB(db); res.json({ ok: true }); });
 
-app.listen(PORT, () => {
-  console.log(`Disparador Magnetico backend rodando na porta ${PORT}`);
+// Endpoint para corrigir o index manualmente
+app.post('/api/dispatch/setindex', (req, res) => {
   const db = loadDB();
-  if (db.dispatch.running && !db.dispatch.paused) { console.log('[STARTUP] Retomando disparo...'); scheduleNext(); }
-  else if (db.dispatch.paused && db.dispatch.pauseReason === 'block' && db.dispatch.blockPauseUntil) {
+  const idx = parseInt(req.body.index);
+  if (!isNaN(idx) && idx >= 0 && idx <= db.contacts.length) {
+    db.dispatch.currentIndex = idx;
+    saveDB(db);
+    console.log(`[SETINDEX] Index definido para ${idx}`);
+    res.json({ ok: true, currentIndex: idx });
+  } else {
+    res.status(400).json({ ok: false, error: 'Index invalido' });
+  }
+});
+
+app.listen(PORT, () => {
+  console.log(`Disparador Magnetico backend v3 rodando na porta ${PORT}`);
+  const db = loadDB();
+  resetDailyIfNeeded(db);
+  saveDB(db);
+  if (db.dispatch.running && !db.dispatch.paused) {
+    console.log(`[STARTUP] Retomando do index ${db.dispatch.currentIndex}`); scheduleNext();
+  } else if (db.dispatch.paused && db.dispatch.pauseReason === 'block' && db.dispatch.blockPauseUntil) {
     if (new Date() >= new Date(db.dispatch.blockPauseUntil)) {
       console.log('[STARTUP] Pausa de bloco expirada — retomando!');
       db.dispatch.paused = false; db.dispatch.pauseReason = null; db.dispatch.blockPauseUntil = null;
