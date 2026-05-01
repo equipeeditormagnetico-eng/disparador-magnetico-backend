@@ -10,6 +10,42 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const DB_FILE = path.join(__dirname, 'db.json');
 
+// MENSAGENS PADRAO — editadas diretamente aqui para nao se perderem
+const DEFAULT_FLOW = {
+  enabled: true,
+  message1: `Você está nos meus grupos de devocional e eu vim aqui te contar algo especial 💖
+*Durante todo o mês de maio, meus livros estão com FRETE GRÁTIS* 🙌
+E são leituras que ajudam a alinhar o coração com Deus no dia a dia.
+Você gostaria de saber mais? 
+Digite:
+1️⃣ Sim, quero.   
+2️⃣ Me conta como funciona.`,
+  message2: `📚Tenho 3 livros que têm abençoado muitas mulheres:
+✨ *Desconectadas* – para mulheres que desejam sair do raso e superficial. 
+✨ *Saindo da Gaiola* – Cura Emocional a Luz da Bíblia 
+✨ *Mulheres da Bíblia* – 328 Conselhos práticos para os dias atuais
+Qual mais fala com você hoje?
+Digite:
+1️⃣ Quero me aproximar mais de Deus.
+2️⃣ Preciso de cura.
+3️⃣ Quero Conselhos para o dia a dia.`,
+  message3: `❤️‍🔥*Este livro é muito profundo e tenho convicção que Deus vai falar ao seu coração.*
+Para garantir o seu, entra no meu site e garanta o seu com frete grátis 👇🏻
+http://danielasantosoficial.com.br
+Se preferir comprar por aqui, me avisa que logo já lhe oriento.`
+};
+
+const DEFAULT_CONFIG = {
+  token: 'F77F594F7E5C002D7C34983F',
+  instanceId: '3F20B7C2424BC14EE41AB61024DC65E0',
+  clientToken: '',
+  intervalMin: 45,
+  intervalMax: 90,
+  blockSize: 10,
+  blockPause: 15,
+  maxPerDay: 30
+};
+
 app.use(cors({ origin: '*' }));
 app.use(express.json());
 
@@ -18,15 +54,35 @@ function loadDB() {
   try { return JSON.parse(fs.readFileSync(DB_FILE, 'utf8')); }
   catch { return defaultDB(); }
 }
-function saveDB(data) { fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2)); }
+
 function defaultDB() {
   return {
-    config: { token:'', instanceId:'', clientToken:'', intervalMin:45, intervalMax:90, blockSize:10, blockPause:15, maxPerDay:30 },
-    contacts: [], messages: ['','','','',''], schedule: {},
-    flow: { enabled: true, message1: '', message2: '', message3: '' },
+    config: { ...DEFAULT_CONFIG },
+    contacts: [],
+    messages: ['','','','',''],
+    schedule: {},
+    flow: { ...DEFAULT_FLOW },
     leads: {},
     dispatch: { running:false, paused:false, pauseReason:null, blockPauseUntil:null, currentIndex:0, sentToday:0, lastDate:'', log:[], history:[] }
   };
+}
+
+function saveDB(data) { fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2)); }
+
+function ensureDB() {
+  const db = loadDB();
+  // Garantir que flow sempre tem as mensagens padrao se estiverem vazias
+  if (!db.flow || !db.flow.message1) {
+    db.flow = { ...DEFAULT_FLOW };
+    saveDB(db);
+    console.log('[DB] Flow restaurado com mensagens padrao');
+  }
+  // Garantir config tem token se estiver vazio
+  if (!db.config.token) {
+    db.config = { ...DEFAULT_CONFIG, ...db.config };
+    saveDB(db);
+  }
+  return db;
 }
 
 let dispatchTimer = null;
@@ -47,6 +103,9 @@ function resetDailyIfNeeded(db) {
 function randomInt(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
 
 async function sendMessage(config, phone, message) {
+  if (!message || !message.trim()) {
+    throw new Error('Mensagem vazia — verifique o fluxo de mensagens');
+  }
   const url = `https://api.z-api.io/instances/${config.instanceId}/token/${config.token}/send-text`;
   const res = await fetch(url, {
     method: 'POST',
@@ -57,105 +116,67 @@ async function sendMessage(config, phone, message) {
   return await res.json();
 }
 
-// ── WEBHOOK Z-API ─────────────────────────────────────────────
+// ── WEBHOOK ───────────────────────────────────────────────────
 app.post('/api/webhook', async (req, res) => {
-  res.json({ ok: true }); // Responde imediatamente
-
+  res.json({ ok: true });
   try {
-    const db = loadDB();
-    if (!db.leads) db.leads = {};
+    const db = ensureDB();
     const body = req.body;
+    console.log('[WEBHOOK]', JSON.stringify(body).substring(0, 300));
 
-    // Log completo para debug
-    console.log('[WEBHOOK RAW]', JSON.stringify(body).substring(0, 400));
+    const fromMe = body.fromMe === true || (body.data && body.data.fromMe === true);
+    if (fromMe) { console.log('[WEBHOOK] Ignorando — fromMe:true'); return; }
 
-    // Verificar se é mensagem enviada por mim (ignorar)
-    const fromMe = body.fromMe === true ||
-                   (body.data && body.data.fromMe === true);
+    const phone = String(body.phone || body.from || (body.data && (body.data.phone || body.data.from)) || '').trim();
+    if (!phone) { console.log('[WEBHOOK] Sem phone'); return; }
 
-    if (fromMe) {
-      console.log('[WEBHOOK] Ignorando — mensagem enviada por mim');
-      return;
-    }
-
-    // Extrair phone
-    const phone = String(body.phone || body.from ||
-                  (body.data && (body.data.phone || body.data.from)) || '').trim();
-
-    if (!phone) {
-      console.log('[WEBHOOK] Sem phone identificado');
-      return;
-    }
-
-    // Extrair texto
     const rawText = body.text || body.caption || body.message ||
                    (body.data && (body.data.text || body.data.caption || body.data.message)) || '';
     const text = (typeof rawText === 'string' ? rawText : JSON.stringify(rawText)).trim().toLowerCase();
 
-    console.log(`[WEBHOOK] 📩 Mensagem de ${phone}: "${text.substring(0, 100)}"`);
+    console.log(`[WEBHOOK] 📩 ${phone}: "${text.substring(0, 80)}"`);
 
-    // Blacklist
-    if (['pare', 'sair', 'remover', 'stop', 'cancelar', 'nao quero', 'não quero'].some(w => text.includes(w))) {
-      if (db.leads[phone]) {
-        db.leads[phone].blacklisted = true;
-        db.leads[phone].flowStep = 'blacklisted';
-        saveDB(db);
-        console.log(`[WEBHOOK] 🚫 ${phone} blacklisted`);
-      }
+    if (['pare', 'sair', 'remover', 'stop', 'cancelar'].some(w => text.includes(w))) {
+      if (db.leads[phone]) { db.leads[phone].blacklisted = true; db.leads[phone].flowStep = 'blacklisted'; saveDB(db); }
       return;
     }
 
+    if (!db.leads) db.leads = {};
     const lead = db.leads[phone];
-    if (!lead) {
-      console.log(`[WEBHOOK] Lead ${phone} nao encontrado no banco`);
-      return;
-    }
+    if (!lead || lead.blacklisted) { console.log(`[WEBHOOK] Lead ${phone} nao encontrado ou blacklisted`); return; }
 
-    if (lead.blacklisted) {
-      console.log(`[WEBHOOK] ${phone} esta na blacklist`);
-      return;
-    }
+    const flow = db.flow || DEFAULT_FLOW;
 
-    const config = db.config;
-    const flow = db.flow;
-
-    // PASSO 1: Respondeu msg1 → envia msg2
     if (lead.flowStep === 'msg1_sent') {
-      console.log(`[FLOW] ${phone} respondeu msg1 — enviando msg2`);
+      console.log(`[FLOW] ${phone} respondeu msg1 → enviando msg2`);
       try {
-        await sendMessage(config, phone, flow.message2);
+        await sendMessage(db.config, phone, flow.message2 || DEFAULT_FLOW.message2);
         db.leads[phone].flowStep = 'msg2_sent';
         db.leads[phone].msg2SentAt = new Date().toISOString();
         db.leads[phone].replied = true;
         saveDB(db);
         console.log(`[FLOW] ✅ Msg2 enviada para ${phone}`);
-      } catch(e) { console.log(`[FLOW] ❌ Erro msg2 ${phone}: ${e.message}`); }
+      } catch(e) { console.log(`[FLOW] ❌ Erro msg2: ${e.message}`); }
       return;
     }
 
-    // PASSO 2: Respondeu msg2 → envia msg3
     if (lead.flowStep === 'msg2_sent') {
-      console.log(`[FLOW] ${phone} respondeu msg2 — enviando msg3`);
+      console.log(`[FLOW] ${phone} respondeu msg2 → enviando msg3`);
       try {
-        await sendMessage(config, phone, flow.message3);
+        await sendMessage(db.config, phone, flow.message3 || DEFAULT_FLOW.message3);
         db.leads[phone].flowStep = 'completed';
         db.leads[phone].completedAt = new Date().toISOString();
         saveDB(db);
         console.log(`[FLOW] ✅ Msg3 enviada para ${phone} — FLUXO COMPLETO!`);
-      } catch(e) { console.log(`[FLOW] ❌ Erro msg3 ${phone}: ${e.message}`); }
+      } catch(e) { console.log(`[FLOW] ❌ Erro msg3: ${e.message}`); }
       return;
     }
-
-    console.log(`[FLOW] ${phone} flowStep atual: ${lead.flowStep} — nenhuma acao`);
-
-  } catch(err) {
-    console.log('[WEBHOOK] Erro geral:', err.message);
-  }
+  } catch(err) { console.log('[WEBHOOK] Erro:', err.message); }
 });
 
 // ── DISPARO ───────────────────────────────────────────────────
 async function runDispatch() {
-  const db = loadDB();
+  const db = ensureDB();
   resetDailyIfNeeded(db);
   if (!db.dispatch.running || db.dispatch.paused) return;
 
@@ -177,22 +198,7 @@ async function runDispatch() {
 
   const contact = contacts[dispatch.currentIndex];
   const phone = String(contact.numero).trim();
-
-  let message = '';
-  if (flow && flow.enabled && flow.message1) {
-    message = flow.message1;
-  } else {
-    const messages = db.messages || [];
-    const validMessages = messages.filter(m => m && m.trim());
-    if (!validMessages.length) { dispatch.running = false; saveDB(db); return; }
-    const msgTemplate = validMessages[Math.floor(Math.random() * validMessages.length)];
-    message = msgTemplate;
-    if (contact.nome && String(contact.nome).trim() && String(contact.nome).trim() !== '0') {
-      message = message.replace(/{nome}/gi, String(contact.nome).trim());
-    } else {
-      message = message.replace(/,?\s*{nome}\s*/gi, '').replace(/\s+/g, ' ').trim();
-    }
-  }
+  const message = flow.message1 || DEFAULT_FLOW.message1;
 
   let status = 'success', error = null;
   try {
@@ -206,10 +212,13 @@ async function runDispatch() {
       viewed: false, replied: false, blacklisted: false,
       msg2SentAt: null, completedAt: null
     };
-    console.log(`[DISPATCH] ✅ ${phone} (${dispatch.currentIndex + 1}/${contacts.length})`);
-  } catch(e) { status = 'error'; error = e.message; console.log(`[DISPATCH] ❌ ${phone}: ${e.message}`); }
+    console.log(`[DISPATCH] ✅ ${phone} (${dispatch.currentIndex + 1}/${contacts.length}) | sentToday:${dispatch.sentToday}`);
+  } catch(e) {
+    status = 'error'; error = e.message;
+    console.log(`[DISPATCH] ❌ ${phone}: ${e.message}`);
+  }
 
-  dispatch.log.unshift({ time: new Date().toISOString(), nome: contact.nome || '', numero: phone, message, status, error });
+  dispatch.log.unshift({ time: new Date().toISOString(), nome: contact.nome || '', numero: phone, message: message.substring(0, 100), status, error });
   if (dispatch.log.length > 500) dispatch.log = dispatch.log.slice(0, 500);
   dispatch.currentIndex++;
 
@@ -233,6 +242,7 @@ function scheduleNext() {
   countdownValue = Math.ceil(delay / 1000);
   const tick = setInterval(() => { if (countdownValue > 0) countdownValue--; }, 1000);
   dispatchTimer = setTimeout(() => { clearInterval(tick); runDispatch(); }, delay);
+  console.log(`[DISPATCH] Proximo em ${countdownValue}s`);
 }
 
 const DAYS = ['sunday','monday','tuesday','wednesday','thursday','friday','saturday'];
@@ -259,7 +269,7 @@ cron.schedule('* * * * *', () => {
     const hhmm = `${String(now.getHours()).padStart(2,'0')}:${String(now.getMinutes()).padStart(2,'0')}`;
     const slots = db.schedule[dayName] || [];
     if (slots.includes(hhmm)) {
-      const db2 = loadDB(); resetDailyIfNeeded(db2);
+      const db2 = ensureDB(); resetDailyIfNeeded(db2);
       db2.dispatch.running = true; db2.dispatch.paused = false;
       db2.dispatch.pauseReason = null; db2.dispatch.blockPauseUntil = null;
       saveDB(db2); scheduleNext();
@@ -268,20 +278,39 @@ cron.schedule('* * * * *', () => {
 });
 
 // ── ROUTES ────────────────────────────────────────────────────
-app.get('/', (_, res) => res.json({ status: 'O Disparador Magnetico + Fluxo v2 online!' }));
-app.post('/api/config', (req, res) => { const db = loadDB(); db.config = { ...db.config, ...req.body }; saveDB(db); console.log('[CONFIG]', db.config); res.json({ ok: true, config: db.config }); });
+app.get('/', (_, res) => res.json({ status: 'O Disparador Magnetico FINAL online!' }));
+
+app.post('/api/config', (req, res) => {
+  const db = loadDB();
+  db.config = { ...db.config, ...req.body };
+  saveDB(db); console.log('[CONFIG]', db.config);
+  res.json({ ok: true, config: db.config });
+});
 app.get('/api/config', (req, res) => res.json(loadDB().config));
-app.post('/api/contacts', (req, res) => { const db = loadDB(); db.contacts = req.body.contacts || []; saveDB(db); res.json({ ok: true, total: db.contacts.length }); });
-app.post('/api/messages', (req, res) => { const db = loadDB(); db.messages = req.body.messages || []; saveDB(db); res.json({ ok: true }); });
-app.post('/api/schedule', (req, res) => { const db = loadDB(); db.schedule = req.body.schedule || {}; saveDB(db); res.json({ ok: true }); });
+
+app.post('/api/contacts', (req, res) => {
+  const db = loadDB(); db.contacts = req.body.contacts || []; saveDB(db);
+  res.json({ ok: true, total: db.contacts.length });
+});
+app.post('/api/messages', (req, res) => {
+  const db = loadDB(); db.messages = req.body.messages || []; saveDB(db);
+  res.json({ ok: true });
+});
+app.post('/api/schedule', (req, res) => {
+  const db = loadDB(); db.schedule = req.body.schedule || {}; saveDB(db);
+  res.json({ ok: true });
+});
 
 app.post('/api/flow/config', (req, res) => {
   const db = loadDB();
-  db.flow = { ...db.flow, ...req.body };
-  saveDB(db); console.log('[FLOW] Config:', db.flow.enabled);
+  db.flow = { ...DEFAULT_FLOW, ...db.flow, ...req.body };
+  saveDB(db); console.log('[FLOW] Config atualizado. enabled:', db.flow.enabled);
   res.json({ ok: true });
 });
-app.get('/api/flow/config', (req, res) => res.json(loadDB().flow || {}));
+app.get('/api/flow/config', (req, res) => {
+  const db = ensureDB();
+  res.json(db.flow);
+});
 app.get('/api/flow/stats', (req, res) => {
   const db = loadDB();
   const leads = Object.values(db.leads || {});
@@ -291,18 +320,18 @@ app.get('/api/flow/stats', (req, res) => {
     msg2_sent: leads.filter(l => l.flowStep === 'msg2_sent').length,
     completed: leads.filter(l => l.flowStep === 'completed').length,
     blacklisted: leads.filter(l => l.blacklisted).length,
-    viewed: leads.filter(l => l.viewed).length,
     leads: leads.slice(0, 100)
   });
 });
 
 app.post('/api/dispatch/start', (req, res) => {
-  const db = loadDB(); resetDailyIfNeeded(db);
+  const db = ensureDB(); resetDailyIfNeeded(db);
   if (dispatchTimer) { clearTimeout(dispatchTimer); dispatchTimer = null; }
   db.dispatch.running = true; db.dispatch.paused = false;
   db.dispatch.pauseReason = null; db.dispatch.blockPauseUntil = null;
   if (req.body && req.body.restart === true) { db.dispatch.currentIndex = 0; db.dispatch.log = []; }
   saveDB(db); scheduleNext();
+  console.log(`[START] Iniciando do index ${db.dispatch.currentIndex}`);
   res.json({ ok: true, startingFrom: db.dispatch.currentIndex });
 });
 
@@ -315,7 +344,7 @@ app.post('/api/dispatch/pause', (req, res) => {
 });
 
 app.post('/api/dispatch/resume', (req, res) => {
-  const db = loadDB();
+  const db = ensureDB();
   db.dispatch.paused = false; db.dispatch.pauseReason = null;
   db.dispatch.blockPauseUntil = null; db.dispatch.running = true;
   saveDB(db); scheduleNext();
@@ -330,7 +359,7 @@ app.post('/api/dispatch/setindex', (req, res) => {
 });
 
 app.get('/api/status', (req, res) => {
-  const db = loadDB(); resetDailyIfNeeded(db);
+  const db = ensureDB(); resetDailyIfNeeded(db);
   const { dispatch, config, contacts, leads, flow } = db;
   let blockPauseMinutesLeft = null;
   if (dispatch.pauseReason === 'block' && dispatch.blockPauseUntil) {
@@ -345,6 +374,7 @@ app.get('/api/status', (req, res) => {
     countdown: countdownValue, log: dispatch.log.slice(0, 50),
     percent: contacts.length ? Math.round((dispatch.currentIndex / contacts.length) * 100) : 0,
     flowEnabled: flow && flow.enabled,
+    msg1Preview: (flow && flow.message1 || '').substring(0, 50),
     flowStats: {
       total: leadsArr.length,
       aguardando: leadsArr.filter(l => l.flowStep === 'msg1_sent').length,
@@ -358,16 +388,12 @@ app.get('/api/status', (req, res) => {
 app.get('/api/history', (req, res) => res.json(loadDB().dispatch.history || []));
 app.delete('/api/history', (req, res) => { const db = loadDB(); db.dispatch.history = []; saveDB(db); res.json({ ok: true }); });
 
-// Endpoint de debug do webhook
-app.post('/api/webhook/test', (req, res) => {
-  console.log('[WEBHOOK TEST]', JSON.stringify(req.body));
-  res.json({ ok: true, received: req.body });
-});
-
 app.listen(PORT, () => {
-  console.log(`Disparador Magnetico + Fluxo v2 rodando na porta ${PORT}`);
-  const db = loadDB();
+  console.log(`Disparador Magnetico FINAL rodando na porta ${PORT}`);
+  const db = ensureDB();
   resetDailyIfNeeded(db); saveDB(db);
+  console.log(`[STARTUP] Flow enabled: ${db.flow.enabled}`);
+  console.log(`[STARTUP] Msg1 preview: ${(db.flow.message1 || '').substring(0, 60)}`);
   if (db.dispatch.running && !db.dispatch.paused) { scheduleNext(); }
   else if (db.dispatch.paused && db.dispatch.pauseReason === 'block' && db.dispatch.blockPauseUntil) {
     if (new Date() >= new Date(db.dispatch.blockPauseUntil)) {
