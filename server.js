@@ -23,12 +23,7 @@ function defaultDB() {
   return {
     config: { token:'', instanceId:'', clientToken:'', intervalMin:45, intervalMax:90, blockSize:10, blockPause:15, maxPerDay:30 },
     contacts: [], messages: ['','','','',''], schedule: {},
-    flow: {
-      enabled: true,
-      message1: '',
-      message2: '',
-      message3: ''
-    },
+    flow: { enabled: true, message1: '', message2: '', message3: '' },
     leads: {},
     dispatch: { running:false, paused:false, pauseReason:null, blockPauseUntil:null, currentIndex:0, sentToday:0, lastDate:'', log:[], history:[] }
   };
@@ -65,25 +60,39 @@ async function sendMessage(config, phone, message) {
 // ── WEBHOOK Z-API ─────────────────────────────────────────────
 app.post('/api/webhook', async (req, res) => {
   res.json({ ok: true }); // Responde imediatamente
-  
-  const db = loadDB();
-  if (!db.leads) db.leads = {};
-  const body = req.body;
-  console.log('[WEBHOOK]', JSON.stringify(body).substring(0, 300));
 
-  // Detectar mensagem recebida do lead
-  const isReceived = body.type === 'ReceivedCallback' || 
-                     body.event === 'message-received' ||
-                     (body.data && body.data.fromMe === false);
+  try {
+    const db = loadDB();
+    if (!db.leads) db.leads = {};
+    const body = req.body;
 
-  if (isReceived) {
-    const phone = body.phone || body.from || 
-                  (body.data && (body.data.phone || body.data.from)) || '';
-    const rawText = body.text || body.message || 
-                   (body.data && (body.data.text || body.data.message)) || '';
+    // Log completo para debug
+    console.log('[WEBHOOK RAW]', JSON.stringify(body).substring(0, 400));
+
+    // Verificar se é mensagem enviada por mim (ignorar)
+    const fromMe = body.fromMe === true ||
+                   (body.data && body.data.fromMe === true);
+
+    if (fromMe) {
+      console.log('[WEBHOOK] Ignorando — mensagem enviada por mim');
+      return;
+    }
+
+    // Extrair phone
+    const phone = String(body.phone || body.from ||
+                  (body.data && (body.data.phone || body.data.from)) || '').trim();
+
+    if (!phone) {
+      console.log('[WEBHOOK] Sem phone identificado');
+      return;
+    }
+
+    // Extrair texto
+    const rawText = body.text || body.caption || body.message ||
+                   (body.data && (body.data.text || body.data.caption || body.data.message)) || '';
     const text = (typeof rawText === 'string' ? rawText : JSON.stringify(rawText)).trim().toLowerCase();
 
-    if (!phone) return;
+    console.log(`[WEBHOOK] 📩 Mensagem de ${phone}: "${text.substring(0, 100)}"`);
 
     // Blacklist
     if (['pare', 'sair', 'remover', 'stop', 'cancelar', 'nao quero', 'não quero'].some(w => text.includes(w))) {
@@ -97,25 +106,36 @@ app.post('/api/webhook', async (req, res) => {
     }
 
     const lead = db.leads[phone];
-    if (!lead || lead.blacklisted) return;
+    if (!lead) {
+      console.log(`[WEBHOOK] Lead ${phone} nao encontrado no banco`);
+      return;
+    }
+
+    if (lead.blacklisted) {
+      console.log(`[WEBHOOK] ${phone} esta na blacklist`);
+      return;
+    }
 
     const config = db.config;
     const flow = db.flow;
 
-    // PASSO DO FLUXO: Respondeu a mensagem 1 → envia mensagem 2
+    // PASSO 1: Respondeu msg1 → envia msg2
     if (lead.flowStep === 'msg1_sent') {
+      console.log(`[FLOW] ${phone} respondeu msg1 — enviando msg2`);
       try {
         await sendMessage(config, phone, flow.message2);
         db.leads[phone].flowStep = 'msg2_sent';
         db.leads[phone].msg2SentAt = new Date().toISOString();
+        db.leads[phone].replied = true;
         saveDB(db);
         console.log(`[FLOW] ✅ Msg2 enviada para ${phone}`);
       } catch(e) { console.log(`[FLOW] ❌ Erro msg2 ${phone}: ${e.message}`); }
       return;
     }
 
-    // PASSO DO FLUXO: Respondeu a mensagem 2 → envia mensagem 3
+    // PASSO 2: Respondeu msg2 → envia msg3
     if (lead.flowStep === 'msg2_sent') {
+      console.log(`[FLOW] ${phone} respondeu msg2 — enviando msg3`);
       try {
         await sendMessage(config, phone, flow.message3);
         db.leads[phone].flowStep = 'completed';
@@ -125,21 +145,11 @@ app.post('/api/webhook', async (req, res) => {
       } catch(e) { console.log(`[FLOW] ❌ Erro msg3 ${phone}: ${e.message}`); }
       return;
     }
-  }
 
-  // Status da mensagem (leitura)
-  const isStatus = body.type === 'MessageStatusCallback' || body.event === 'message-status';
-  if (isStatus) {
-    const phone = body.phone || body.to || (body.data && body.data.phone) || '';
-    const status = body.status || (body.data && body.data.status) || '';
-    if (phone && db.leads[phone]) {
-      if (['READ','read','SEEN','seen'].includes(status)) {
-        db.leads[phone].viewed = true;
-        db.leads[phone].viewedAt = new Date().toISOString();
-        saveDB(db);
-        console.log(`[WEBHOOK] 👁️ ${phone} visualizou`);
-      }
-    }
+    console.log(`[FLOW] ${phone} flowStep atual: ${lead.flowStep} — nenhuma acao`);
+
+  } catch(err) {
+    console.log('[WEBHOOK] Erro geral:', err.message);
   }
 });
 
@@ -168,7 +178,6 @@ async function runDispatch() {
   const contact = contacts[dispatch.currentIndex];
   const phone = String(contact.numero).trim();
 
-  // Usar mensagem 1 do fluxo se estiver habilitado, senão usar mensagens avulsas
   let message = '';
   if (flow && flow.enabled && flow.message1) {
     message = flow.message1;
@@ -189,18 +198,13 @@ async function runDispatch() {
   try {
     await sendMessage(config, phone, message);
     dispatch.sentToday++;
-
-    // Registrar lead no fluxo
     if (!db.leads) db.leads = {};
     db.leads[phone] = {
-      numero: phone,
-      nome: contact.nome || '',
+      numero: phone, nome: contact.nome || '',
       sentAt: new Date().toISOString(),
       flowStep: 'msg1_sent',
-      viewed: false,
-      blacklisted: false,
-      msg2SentAt: null,
-      completedAt: null
+      viewed: false, replied: false, blacklisted: false,
+      msg2SentAt: null, completedAt: null
     };
     console.log(`[DISPATCH] ✅ ${phone} (${dispatch.currentIndex + 1}/${contacts.length})`);
   } catch(e) { status = 'error'; error = e.message; console.log(`[DISPATCH] ❌ ${phone}: ${e.message}`); }
@@ -214,8 +218,7 @@ async function runDispatch() {
   if (dispatch.currentIndex % blockSize === 0 && dispatch.currentIndex < contacts.length) {
     const resumeAt = new Date(Date.now() + blockPause * 60 * 1000).toISOString();
     dispatch.paused = true; dispatch.pauseReason = 'block'; dispatch.blockPauseUntil = resumeAt;
-    saveDB(db);
-    console.log(`[DISPATCH] Pausa de bloco — retomando em ${blockPause}min`); return;
+    saveDB(db); return;
   }
 
   saveDB(db);
@@ -240,7 +243,6 @@ cron.schedule('* * * * *', () => {
 
   if (db.dispatch.paused && db.dispatch.pauseReason === 'block' && db.dispatch.blockPauseUntil) {
     if (now >= new Date(db.dispatch.blockPauseUntil)) {
-      console.log(`[CRON] ✅ Retomando bloco do index ${db.dispatch.currentIndex}`);
       db.dispatch.paused = false; db.dispatch.pauseReason = null; db.dispatch.blockPauseUntil = null;
       saveDB(db); scheduleNext();
     }
@@ -261,30 +263,25 @@ cron.schedule('* * * * *', () => {
       db2.dispatch.running = true; db2.dispatch.paused = false;
       db2.dispatch.pauseReason = null; db2.dispatch.blockPauseUntil = null;
       saveDB(db2); scheduleNext();
-      console.log(`[CRON] Agendamento ${dayName} ${hhmm} — index:${db2.dispatch.currentIndex}`);
     }
   }
 });
 
 // ── ROUTES ────────────────────────────────────────────────────
-app.get('/', (_, res) => res.json({ status: 'O Disparador Magnetico + Fluxo backend online!' }));
-app.post('/api/config', (req, res) => { const db = loadDB(); db.config = { ...db.config, ...req.body }; saveDB(db); res.json({ ok: true, config: db.config }); });
+app.get('/', (_, res) => res.json({ status: 'O Disparador Magnetico + Fluxo v2 online!' }));
+app.post('/api/config', (req, res) => { const db = loadDB(); db.config = { ...db.config, ...req.body }; saveDB(db); console.log('[CONFIG]', db.config); res.json({ ok: true, config: db.config }); });
 app.get('/api/config', (req, res) => res.json(loadDB().config));
 app.post('/api/contacts', (req, res) => { const db = loadDB(); db.contacts = req.body.contacts || []; saveDB(db); res.json({ ok: true, total: db.contacts.length }); });
 app.post('/api/messages', (req, res) => { const db = loadDB(); db.messages = req.body.messages || []; saveDB(db); res.json({ ok: true }); });
 app.post('/api/schedule', (req, res) => { const db = loadDB(); db.schedule = req.body.schedule || {}; saveDB(db); res.json({ ok: true }); });
 
-// Flow routes
 app.post('/api/flow/config', (req, res) => {
   const db = loadDB();
   db.flow = { ...db.flow, ...req.body };
-  saveDB(db);
-  console.log('[FLOW] Configurado:', db.flow);
+  saveDB(db); console.log('[FLOW] Config:', db.flow.enabled);
   res.json({ ok: true });
 });
-
 app.get('/api/flow/config', (req, res) => res.json(loadDB().flow || {}));
-
 app.get('/api/flow/stats', (req, res) => {
   const db = loadDB();
   const leads = Object.values(db.leads || {});
@@ -361,8 +358,14 @@ app.get('/api/status', (req, res) => {
 app.get('/api/history', (req, res) => res.json(loadDB().dispatch.history || []));
 app.delete('/api/history', (req, res) => { const db = loadDB(); db.dispatch.history = []; saveDB(db); res.json({ ok: true }); });
 
+// Endpoint de debug do webhook
+app.post('/api/webhook/test', (req, res) => {
+  console.log('[WEBHOOK TEST]', JSON.stringify(req.body));
+  res.json({ ok: true, received: req.body });
+});
+
 app.listen(PORT, () => {
-  console.log(`Disparador Magnetico + Fluxo backend rodando na porta ${PORT}`);
+  console.log(`Disparador Magnetico + Fluxo v2 rodando na porta ${PORT}`);
   const db = loadDB();
   resetDailyIfNeeded(db); saveDB(db);
   if (db.dispatch.running && !db.dispatch.paused) { scheduleNext(); }
