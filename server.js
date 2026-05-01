@@ -38,7 +38,7 @@ Se preferir comprar por aqui, me avisa que logo já lhe oriento.`
 const DEFAULT_CONFIG = {
   token: 'F77F594F7E5C002D7C34983F',
   instanceId: '3F20B7C2424BC14EE41AB61024DC65E0',
-  clientToken: '',
+  clientToken: 'Fe0074d5b816c40c59256907dd6fe40eaS',
   intervalMin: 45,
   intervalMax: 90,
   blockSize: 10,
