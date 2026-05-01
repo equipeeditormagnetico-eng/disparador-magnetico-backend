@@ -38,7 +38,7 @@ Se preferir comprar por aqui, me avisa que logo já lhe oriento.`
 const DEFAULT_CONFIG = {
   token: 'F77F594F7E5C002D7C34983F',
   instanceId: '3F20B7C2424BC14EE41AB61024DC65E0',
-  clientToken: 'Fe0074d5b816c40c59256907dd6fe40eaS',
+  clientToken: '',
   intervalMin: 45,
   intervalMax: 90,
   blockSize: 10,
@@ -127,8 +127,26 @@ app.post('/api/webhook', async (req, res) => {
     const fromMe = body.fromMe === true || (body.data && body.data.fromMe === true);
     if (fromMe) { console.log('[WEBHOOK] Ignorando — fromMe:true'); return; }
 
-    const phone = String(body.phone || body.from || (body.data && (body.data.phone || body.data.from)) || '').trim();
+    const rawPhone = String(body.phone || body.from || (body.data && (body.data.phone || body.data.from)) || '').trim();
+    // Normalizar numero — remover @s.whatsapp.net, @c.us, espacos, tracoes
+    const phone = rawPhone.replace(/@.*/g, '').replace(/[^0-9]/g, '').trim();
     if (!phone) { console.log('[WEBHOOK] Sem phone'); return; }
+
+    // Tentar formatos alternativos do numero brasileiro (com e sem o 9)
+    function findLead(db, phone) {
+      if (db.leads && db.leads[phone]) return phone;
+      // Tentar adicionar o 9 apos o DDD (55XX -> 55XX9)
+      if (phone.length === 12 && phone.startsWith('55')) {
+        const with9 = phone.slice(0,4) + '9' + phone.slice(4);
+        if (db.leads && db.leads[with9]) return with9;
+      }
+      // Tentar remover o 9 apos o DDD (55XX9 -> 55XX)
+      if (phone.length === 13 && phone.startsWith('55')) {
+        const without9 = phone.slice(0,4) + phone.slice(5);
+        if (db.leads && db.leads[without9]) return without9;
+      }
+      return null;
+    }
 
     const rawText = body.text || body.caption || body.message ||
                    (body.data && (body.data.text || body.data.caption || body.data.message)) || '';
@@ -137,13 +155,16 @@ app.post('/api/webhook', async (req, res) => {
     console.log(`[WEBHOOK] 📩 ${phone}: "${text.substring(0, 80)}"`);
 
     if (['pare', 'sair', 'remover', 'stop', 'cancelar'].some(w => text.includes(w))) {
-      if (db.leads[phone]) { db.leads[phone].blacklisted = true; db.leads[phone].flowStep = 'blacklisted'; saveDB(db); }
+      if (db.leads[phone]) { db.leads[leadPhone || phone].blacklisted = true; db.leads[leadPhone || phone].flowStep = 'blacklisted'; saveDB(db); }
       return;
     }
 
     if (!db.leads) db.leads = {};
-    const lead = db.leads[phone];
+    const foundPhone = findLead(db, phone);
+    const lead = foundPhone ? db.leads[foundPhone] : null;
     if (!lead || lead.blacklisted) { console.log(`[WEBHOOK] Lead ${phone} nao encontrado ou blacklisted`); return; }
+    // Usar o numero correto encontrado no banco
+    const leadPhone = foundPhone;
 
     const flow = db.flow || DEFAULT_FLOW;
 
@@ -151,9 +172,9 @@ app.post('/api/webhook', async (req, res) => {
       console.log(`[FLOW] ${phone} respondeu msg1 → enviando msg2`);
       try {
         await sendMessage(db.config, phone, flow.message2 || DEFAULT_FLOW.message2);
-        db.leads[phone].flowStep = 'msg2_sent';
-        db.leads[phone].msg2SentAt = new Date().toISOString();
-        db.leads[phone].replied = true;
+        db.leads[leadPhone].flowStep = 'msg2_sent';
+        db.leads[leadPhone].msg2SentAt = new Date().toISOString();
+        db.leads[leadPhone].replied = true;
         saveDB(db);
         console.log(`[FLOW] ✅ Msg2 enviada para ${phone}`);
       } catch(e) { console.log(`[FLOW] ❌ Erro msg2: ${e.message}`); }
@@ -164,8 +185,8 @@ app.post('/api/webhook', async (req, res) => {
       console.log(`[FLOW] ${phone} respondeu msg2 → enviando msg3`);
       try {
         await sendMessage(db.config, phone, flow.message3 || DEFAULT_FLOW.message3);
-        db.leads[phone].flowStep = 'completed';
-        db.leads[phone].completedAt = new Date().toISOString();
+        db.leads[leadPhone].flowStep = 'completed';
+        db.leads[leadPhone].completedAt = new Date().toISOString();
         saveDB(db);
         console.log(`[FLOW] ✅ Msg3 enviada para ${phone} — FLUXO COMPLETO!`);
       } catch(e) { console.log(`[FLOW] ❌ Erro msg3: ${e.message}`); }
