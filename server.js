@@ -79,8 +79,9 @@ app.post('/api/webhook', async (req, res) => {
   if (isReceived) {
     const phone = body.phone || body.from || 
                   (body.data && (body.data.phone || body.data.from)) || '';
-    const text = (body.text || body.message || 
-                 (body.data && (body.data.text || body.data.message)) || '').trim().toLowerCase();
+    const rawText = body.text || body.message || 
+                   (body.data && (body.data.text || body.data.message)) || '';
+    const text = (typeof rawText === 'string' ? rawText : JSON.stringify(rawText)).trim().toLowerCase();
 
     if (!phone) return;
 
