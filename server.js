@@ -107,13 +107,14 @@ app.post('/api/webhook', async (req, res) => {
     const body = req.body;
     console.log('[WEBHOOK]', JSON.stringify(body).substring(0, 300));
 
-    // IGNORAR status callbacks (SENT, DELIVERED, READ, etc)
+    // IGNORAR status callbacks — apenas quando tem type=MessageStatusCallback ou ids[]
+    // NAO ignorar mensagens reais que tem status=RECEIVED mas sao mensagens de texto
     const isStatusCallback =
       body.type === 'MessageStatusCallback' ||
       body.event === 'message-status' ||
       (body.ids && Array.isArray(body.ids)) ||
-      ['SENT','DELIVERED','READ','READ_BY_ME','RECEIVED','PLAYED'].includes(body.status);
-    if (isStatusCallback) { console.log('[WEBHOOK] Ignorando status:', body.status || body.type); return; }
+      (body.status && ['SENT','DELIVERED','READ','READ_BY_ME','PLAYED'].includes(body.status) && !body.isStatusReply && !body.messageId);
+    if (isStatusCallback) { console.log('[WEBHOOK] Ignorando status callback:', body.status || body.type); return; }
 
     // IGNORAR fromMe
     const fromMe = body.fromMe === true || (body.data && body.data.fromMe === true);
