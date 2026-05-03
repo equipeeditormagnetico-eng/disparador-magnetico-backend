@@ -151,7 +151,20 @@ app.post('/api/webhook', async (req, res) => {
     const flow = db.flow || DEFAULT_FLOW;
 
     if (lead.flowStep === 'msg1_sent') {
-      console.log(`[FLOW] ${phone} respondeu msg1 → enviando msg2`);
+      // Reconhecer respostas naturais em portugues
+      const tl = text.toLowerCase().trim();
+      const isNegative = ['nao','não','obrigada','obrigado','agora nao','agora não',
+        'depois','num quero','nao quero','não quero','dispensa','dispenso'].some(w => tl === w || tl.includes(w));
+      
+      if (isNegative) {
+        console.log(`[FLOW] ${phone} recusou — blacklistando`);
+        db.leads[leadPhone].blacklisted = true;
+        db.leads[leadPhone].flowStep = 'blacklisted';
+        saveDB(db); return;
+      }
+
+      // Qualquer outra resposta avanca o fluxo
+      console.log(`[FLOW] ${phone} respondeu msg1 ("${tl}") → enviando msg2`);
       try {
         await sendMessage(db.config, leadPhone, flow.message2 || DEFAULT_FLOW.message2);
         db.leads[leadPhone].flowStep = 'msg2_sent';
